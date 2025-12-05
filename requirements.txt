@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+psycopg2-binary
+SQLAlchemy
+databases[postgresql]
+python-decouple
