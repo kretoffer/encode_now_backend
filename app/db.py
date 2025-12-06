@@ -1,5 +1,6 @@
 import sqlalchemy
 from sqlalchemy import inspect
+from sqlalchemy.sql import func as sqlfunc
 from databases import Database
 from decouple import config
 
@@ -29,6 +30,16 @@ messages = sqlalchemy.Table(
 )
 
 
+message_hashes = sqlalchemy.Table(
+    "message_hashes",
+    metadata,
+    sqlalchemy.Column("id", sqlalchemy.BigInteger, primary_key=True),
+    sqlalchemy.Column("recipient_id", sqlalchemy.Integer, sqlalchemy.ForeignKey("users.id"), nullable=False, index=True),
+    sqlalchemy.Column("message_hash", sqlalchemy.String(64), nullable=False),
+    sqlalchemy.Column("created_at", sqlalchemy.DateTime(timezone=True), server_default=sqlfunc.now(), nullable=False),
+)
+
+
 # Engine for creating tables
 engine = sqlalchemy.create_engine(DATABASE_URL)
 
@@ -36,7 +47,7 @@ engine = sqlalchemy.create_engine(DATABASE_URL)
 def check_and_create_tables():
     """Checks if the required tables exist and creates them if they don't."""
     inspector = inspect(engine)
-    required_tables = {"users", "messages"}
+    required_tables = {"users", "messages", "message_hashes"}
     existing_tables = set(inspector.get_table_names())
 
     if not required_tables.issubset(existing_tables):
