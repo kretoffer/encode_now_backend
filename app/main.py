@@ -1,7 +1,8 @@
+import asyncio
 import hashlib
 import sqlalchemy
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, Dict, List
 
 from fastapi import FastAPI, Request, Header, HTTPException, Query
 
@@ -9,6 +10,13 @@ from .db import database, users, messages, message_hashes, check_and_create_tabl
 
 # --- Constants ---
 REPLAY_ATTACK_HASH_COUNT = 50
+POLL_TIMEOUT = 45  # seconds
+
+# --- In-memory state for Long Polling ---
+# These are not suitable for multi-worker production environments.
+# A proper implementation would use a message queue like Redis Pub/Sub.
+waiting_clients: Dict[int, asyncio.Event] = {}
+new_messages: Dict[int, List] = {}
 
 
 @asynccontextmanager
@@ -46,7 +54,8 @@ async def save_message(
     x_sender_public_key: str = Header(...),
 ):
     """
-    Saves an encrypted message and protects against replay attacks.
+    Saves an encrypted message, protects against replay attacks, and notifies
+    long-polling clients.
     """
     ciphertext = await request.body()
     if not ciphertext:
@@ -66,6 +75,7 @@ async def save_message(
         if await database.fetch_one(query):
             raise HTTPException(status_code=409, detail="Duplicate message detected.")
 
+        message_id = None
         async with database.transaction():
             # 1. Insert the message
             query = messages.insert().values(
@@ -95,13 +105,65 @@ async def save_message(
                     await database.execute(
                         message_hashes.delete().where(message_hashes.c.id == oldest_hash_id)
                     )
-        
+
+        # Notify waiting long-poll client, if any
+        if recipient_id in waiting_clients:
+            message_query = messages.select().where(messages.c.id == message_id)
+            new_message_data = await database.fetch_one(message_query)
+            # Ensure new_messages list exists for the recipient
+            if recipient_id not in new_messages:
+                new_messages[recipient_id] = []
+            new_messages[recipient_id].append(dict(new_message_data))
+            waiting_clients[recipient_id].set()
+
         return {"message_id": message_id}
 
     except HTTPException as e:
         raise e  # Re-raise to preserve status code and detail
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save message: {e}")
+
+
+@app.get("/poll/messages")
+async def poll_for_messages(request: Request, public_key: str):
+    """
+    Waits for new messages for a given public key (Long Polling).
+    Responds immediately if messages are pending, otherwise waits for
+    `POLL_TIMEOUT` seconds.
+    """
+    user_id = await get_user(public_key)
+    if not user_id:
+        raise HTTPException(status_code=404, detail="User not found.")
+    
+    # If messages already arrived while not polling, return them immediately
+    if user_id in new_messages and new_messages[user_id]:
+        messages_to_return = new_messages.pop(user_id)
+        return messages_to_return
+
+    event = asyncio.Event()
+    waiting_clients[user_id] = event
+    
+    # Initialize message list for this polling cycle
+    new_messages[user_id] = []
+
+    try:
+        # Wait for the event to be set or timeout
+        await asyncio.wait_for(event.wait(), timeout=POLL_TIMEOUT)
+        
+        # If event was set, retrieve messages
+        messages_to_return = new_messages.get(user_id, [])
+        return messages_to_return
+
+    except asyncio.TimeoutError:
+        # No new messages within the timeout window
+        return [] # Return 200 OK with an empty list
+    
+    finally:
+        # Clean up after the request is done
+        if user_id in waiting_clients:
+            del waiting_clients[user_id]
+        if user_id in new_messages:
+            del new_messages[user_id]
 
 
 @app.get("/messages/")
